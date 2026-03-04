@@ -1,27 +1,64 @@
 # attend
 
-AI meeting delegate (self-hosted, open source).
+Self-hosted AI meeting delegate.
 
-## Modes
-- Ghost Mode: Join + transcribe + summarize
-- Agent Mode: Join + transcribe + answer in-meeting (TTS)
+## Current status
+- ✅ Step 1 complete: architecture/scope locked
+- ✅ Step 2 complete: Chrome tab audio capture → local backend WebSocket ingest PoC
+- ⏳ Step 3+: STT/summary/agent mode pending
 
-## Quick start
+See `IMPLEMENTATION_PLAN.md` and `requirements.md`.
 
+---
+
+## PoC (Step 2) run guide
+
+### 1) Start backend
 ```bash
+cd /Users/sanghee/.openclaw/workspace/projects/attend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-python -m attend
+python -m backend
 ```
 
-Open: http://127.0.0.1:8877
+Backend runs on `http://127.0.0.1:8877`.
 
-## Required keys
-- `RECALL_API_KEY` (required)
-- `ANTHROPIC_API_KEY` (required)
-- `ELEVENLABS_API_KEY` (optional, only for Agent Mode voice)
+- Health: `GET /api/health`
+- Session stats: `GET /api/sessions`
+- WebSocket ingest: `ws://127.0.0.1:8877/ws/audio?session=<id>`
 
-## Status
-Prototype in progress (v0.1.0-dev)
+### 2) Load Chrome extension
+1. Open `chrome://extensions`
+2. Enable **Developer mode**
+3. Click **Load unpacked**
+4. Select folder: `.../projects/attend/extension`
+
+### 3) Capture test
+1. Open Zoom/Meet tab in Chrome
+2. Click extension icon
+3. Press **Start capture**
+4. Talk in meeting tab for ~10s
+5. Press **Stop capture**
+6. Check backend stats at `/api/sessions`
+7. Verify file in `recordings/<session>.webm`
+
+---
+
+## Repo layout (current)
+
+```text
+attend/
+├── extension/                 # Chrome MV3 extension (PoC)
+│   ├── manifest.json
+│   ├── background.js
+│   ├── popup.html
+│   └── popup.js
+├── backend/                   # local FastAPI backend (PoC)
+│   ├── __main__.py
+│   └── app.py
+├── recordings/                # captured webm chunks (runtime output)
+├── IMPLEMENTATION_PLAN.md
+├── requirements.md
+└── requirements.txt
+```

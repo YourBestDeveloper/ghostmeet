@@ -12,6 +12,9 @@ node_modules/
 .env
 .env.local
 
+# Runtime outputs
+recordings/
+
 # IDE
 .vscode/
 .idea/
