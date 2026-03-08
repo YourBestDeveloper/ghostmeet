@@ -31,15 +31,22 @@ Chrome Extension must be installed in developer mode from `extension/` folder.
 
 Default backend: `http://127.0.0.1:8877`
 
-## What You Can Do
+## What This Skill Can Do
 
-- **"Summarize my last meeting"** → generate AI summary from the latest session
-- **"How many meetings did I have today?"** → list all sessions
-- **"What was discussed?"** → fetch full transcript
-- **"Extract action items"** → pull tasks from the summary
-- **"Check ghostmeet status"** → backend health check
+- **List sessions** → query recorded meeting sessions
+- **Fetch transcripts** → retrieve full text from a session
+- **Generate summaries** → trigger AI summary via Claude API (requires `GHOSTMEET_ANTHROPIC_KEY`)
+- **Health check** → verify backend is running
 
-> Note: Starting/stopping live recording is done through the Chrome Extension. This skill handles **querying and summarizing recorded sessions**.
+## What This Skill Cannot Do
+
+- **Start/stop recording** → must be done manually via the Chrome Extension
+- **Install the Chrome Extension** → user must load it in developer mode from `extension/` folder
+- **Access browser audio** → only the Chrome Extension captures audio; this skill only reads API results
+
+## Required Environment Variables
+
+- `GHOSTMEET_ANTHROPIC_KEY` — required for AI summary generation. Without it, transcription still works but summaries will fail.
 
 ## API Commands
 
