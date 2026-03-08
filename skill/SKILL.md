@@ -33,13 +33,13 @@ Default backend: `http://127.0.0.1:8877`
 
 ## What You Can Do
 
-- **"지난 회의 요약해줘"** → 최근 세션의 AI 요약 생성
-- **"오늘 회의 몇 개였어?"** → 세션 목록 조회
-- **"회의에서 뭐 얘기했어?"** → 전체 트랜스크립트 조회
-- **"액션 아이템 뽑아줘"** → 요약에서 할 일 추출
-- **"ghostmeet 상태 확인"** → 백엔드 헬스체크
+- **"Summarize my last meeting"** → generate AI summary from the latest session
+- **"How many meetings did I have today?"** → list all sessions
+- **"What was discussed?"** → fetch full transcript
+- **"Extract action items"** → pull tasks from the summary
+- **"Check ghostmeet status"** → backend health check
 
-> Note: 실시간 녹음 시작/종료는 Chrome Extension에서 직접 해야 합니다. 이 스킬은 **녹음된 세션의 조회/요약**을 담당합니다.
+> Note: Starting/stopping live recording is done through the Chrome Extension. This skill handles **querying and summarizing recorded sessions**.
 
 ## API Commands
 
