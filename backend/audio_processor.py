@@ -34,10 +34,16 @@ def transcribe_webm_file(webm_path: str | Path, transcriber) -> list:
     raw_segments = list(segments_gen)
     logger.info("Whisper returned %d raw segments", len(raw_segments))
 
+    # skip segments we already have (based on start time)
+    last_end = transcriber.transcript[-1].end if transcriber.transcript else 0.0
+
     new_segments = []
     for seg in raw_segments:
         text = seg.text.strip()
         if not text:
+            continue
+        # skip segments that overlap with what we already transcribed
+        if seg.start < last_end - 0.5:
             continue
         segment = Segment(
             text=text,
@@ -48,5 +54,5 @@ def transcribe_webm_file(webm_path: str | Path, transcriber) -> list:
         new_segments.append(segment)
         logger.info("[%.1f-%.1f] %s", segment.start, segment.end, text)
 
-    logger.info("Transcription complete: %d segments", len(new_segments))
+    logger.info("Transcription complete: %d new segments (%d total)", len(new_segments), len(transcriber.transcript))
     return new_segments

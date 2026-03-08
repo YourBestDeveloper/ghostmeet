@@ -1,52 +1,134 @@
-# ghostmeet
+<p align="center">
+  <img src="assets/logo.jpg" width="200" alt="ghostmeet logo">
+</p>
 
-Self-hosted AI meeting delegate — live captions and summaries from any browser tab.
+<h1 align="center">ghostmeet</h1>
 
-## Current status
-- ✅ Step 1: Architecture/scope locked
-- ✅ Step 2: Chrome tab audio capture → WebSocket → local backend
-- ✅ Step 3: Real-time STT pipeline (faster-whisper)
-- ✅ Step 4: Extension live captions UI (side panel)
-- ⏳ Step 5+: Summary engine, agent mode pending
+<p align="center">
+  <strong>Your invisible AI meeting assistant</strong><br>
+  Live captions and smart summaries — right in your browser.
+</p>
 
-See `IMPLEMENTATION_PLAN.md` for full roadmap.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#how-it-works">How It Works</a> •
+  <a href="#features">Features</a> •
+  <a href="#api">API</a>
+</p>
 
 ---
+
+<p align="center">
+  <img src="assets/demo.gif" alt="ghostmeet demo" width="800">
+</p>
+
+## What is ghostmeet?
+
+ghostmeet silently captures audio from any browser tab — Google Meet, Zoom, Teams, or anything with sound — and transcribes it in real-time using Whisper. When the meeting ends, click **Summarize** and AI extracts key decisions, action items, and next steps.
+
+It runs as a **Chrome Extension side panel**. Other participants can't see it. Like a ghost in your meeting. 👻
+
+- **100% local** — audio never leaves your machine
+- **No accounts** — no sign-up, no cloud, no subscriptions
+- **Works everywhere** — any tab that plays audio
+
+## Features
+
+- 🎙️ **Real-time transcription** — Whisper STT, updates every 10 seconds
+- 📋 **AI-powered summaries** — Key decisions, action items, next steps
+- 📎 **Meeting context** — Add agenda or attach files before the meeting
+- 🔒 **Self-hosted** — your audio stays on your machine
+- 🐳 **One-command setup** — `docker compose up` and you're ready
+- 👻 **Invisible** — side panel UI, no one in the meeting knows
+
+## How It Works
+
+```
+Browser Tab (Zoom / Meet / Teams)
+    │
+    ├── Chrome Extension captures tab audio (chrome.tabCapture)
+    │
+    ▼
+WebSocket ──→ Local Backend (FastAPI + Whisper)
+                  │
+                  ├── Real-time STT ──→ Live Captions (Side Panel)
+                  │
+                  └── Claude AI (on demand) ──→ Meeting Summary
+```
+
+Everything runs on your machine. The only external call is to Claude API when you click Summarize (optional — transcription works without it).
 
 ## Quick Start
 
-### Option A: Docker (recommended)
+### Prerequisites
+
+- **Docker** (recommended) or Python 3.10+
+- **Chrome** browser
+
+### 1) Start the backend
+
 ```bash
 git clone https://github.com/Higangssh/ghostmeet.git
 cd ghostmeet
-docker compose up
-```
-That's it. Backend + Whisper model ready on `http://localhost:8877`.
 
-### Option B: Manual
+# Copy and edit config (add your Anthropic API key for summaries)
+cp .env.example .env
+
+# Start with Docker
+docker compose up -d
+```
+
+Backend is ready when you see `http://0.0.0.0:8877` in the logs.
+
+<details>
+<summary><strong>Manual install (without Docker)</strong></summary>
+
 ```bash
-cd ghostmeet
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# default model: base (options: tiny, base, small)
-GHOSTMEET_MODEL=base python -m backend
+python -m backend
 ```
 
-### 2) Load Chrome extension
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. Click **Load unpacked** → select `extension/` folder
+Note: First run downloads the Whisper model (~150MB for `base`).
+</details>
+
+### 2) Install Chrome Extension
+
+1. Open **chrome://extensions** in Chrome
+2. Enable **Developer mode** (toggle in top-right)
+3. Click **Load unpacked**
+4. Select the `extension/` folder from this repo
+5. Pin the 👻 icon in your toolbar
 
 ### 3) Use it
-1. Open a meeting tab (Google Meet, Zoom web, etc.)
-2. Click ghostmeet extension icon → **Start Capture**
-3. Side panel opens automatically with live captions
-4. Click **Stop Capture** when done
-5. View transcript: `GET http://127.0.0.1:8877/api/sessions/{id}/transcript`
 
----
+1. **Join a meeting** — Open Google Meet, Zoom, Teams (or any tab with audio)
+2. **Click 👻** — Side panel opens on the right
+3. **Click ▶ Start** — Live captions appear as people speak
+4. **Click ■ Stop** — When the meeting ends
+5. **Click 📋 Summarize** — AI generates a structured summary
+
+That's it. No sign-up, no config, no cloud.
+
+## Configuration
+
+Set these in `.env` or `docker-compose.yml`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GHOSTMEET_MODEL` | `base` | Whisper model size (`tiny` / `base` / `small` / `medium` / `large`) |
+| `GHOSTMEET_DEVICE` | `auto` | Compute device (`auto` / `cpu` / `cuda`) |
+| `GHOSTMEET_LANGUAGE` | auto-detect | Force language (`en` / `ko` / `ja` / etc.) |
+| `GHOSTMEET_CHUNK_INTERVAL` | `10` | Seconds between transcription updates |
+| `GHOSTMEET_ANTHROPIC_KEY` | — | Required for AI summaries |
+| `GHOSTMEET_HOST` | `0.0.0.0` | Server bind address |
+| `GHOSTMEET_PORT` | `8877` | Server port |
+
+**Model size guide:**
+- `tiny` — fastest, least accurate (~75MB)
+- `base` — good balance (recommended, ~150MB)
+- `small` — better accuracy, slower (~500MB)
+- `medium` / `large` — best accuracy, needs GPU
 
 ## API
 
@@ -56,37 +138,44 @@ GHOSTMEET_MODEL=base python -m backend
 | `/api/sessions` | GET | List all sessions |
 | `/api/sessions/{id}` | GET | Session details |
 | `/api/sessions/{id}/transcript` | GET | Full transcript |
-| `/ws/audio` | WS | Audio ingest |
+| `/api/sessions/{id}/summarize` | POST | Generate AI summary |
+| `/api/sessions/{id}/summary` | GET | Get generated summary |
+| `/ws/audio` | WS | Audio ingest (binary) |
 | `/ws/transcript/{id}` | WS | Live transcript stream |
 
-## Environment Variables
+## Project Structure
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GHOSTMEET_MODEL` | `base` | Whisper model size (`tiny`/`base`/`small`) |
-| `GHOSTMEET_DEVICE` | `auto` | Compute device (`auto`/`cpu`/`cuda`) |
-| `GHOSTMEET_LANGUAGE` | auto-detect | Language code (`en`/`ko`/`ja`/etc.) |
-
----
-
-## Repo Layout
-
-```text
-ghostmeet/
-├── extension/              # Chrome MV3 extension
-│   ├── manifest.json
-│   ├── background.js       # tab audio capture + WebSocket
-│   ├── popup.html/js       # start/stop controls
-│   ├── sidepanel.html      # live captions UI
-│   ├── sidepanel.js        # transcript WebSocket client
-│   └── sidepanel.css       # dark theme styles
-├── backend/                # FastAPI backend
-│   ├── app.py              # main server + routes
-│   ├── audio_processor.py  # ffmpeg webm→PCM conversion
-│   ├── transcriber.py      # faster-whisper wrapper
-│   └── models.py           # data models
-├── recordings/             # captured audio (runtime)
-├── IMPLEMENTATION_PLAN.md
-├── requirements.md
-└── requirements.txt
 ```
+ghostmeet/
+├── extension/              # Chrome MV3 Extension
+│   ├── manifest.json       # permissions + side panel config
+│   ├── background.js       # tab audio capture → WebSocket
+│   ├── sidepanel.html/js   # live captions UI
+│   ├── popup.html/js       # start/stop controls
+│   └── icons/              # extension icons
+├── backend/                # Python backend (FastAPI)
+│   ├── app.py              # HTTP + WebSocket server
+│   ├── audio_processor.py  # Whisper transcription pipeline
+│   ├── transcriber.py      # faster-whisper wrapper
+│   ├── summarizer.py       # Claude API integration
+│   └── models.py           # session + segment models
+├── assets/                 # logo, demo GIF
+├── docker-compose.yml      # one-command deployment
+├── Dockerfile              # backend container
+└── requirements.txt        # Python dependencies
+```
+
+## Roadmap
+
+- [x] Real-time transcription (Whisper)
+- [x] Chrome Extension side panel UI
+- [x] AI meeting summaries (Claude)
+- [x] Meeting context input + file attach
+- [ ] Speaker diarization (who said what)
+- [ ] Export to Markdown / PDF
+- [ ] Multi-language support
+- [ ] Agent Mode — AI speaks in the meeting for you
+
+## License
+
+[MIT](LICENSE)

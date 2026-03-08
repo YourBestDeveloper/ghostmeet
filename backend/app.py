@@ -32,6 +32,12 @@ CHUNK_INTERVAL = int(os.environ.get("GHOSTMEET_CHUNK_INTERVAL", "300"))
 
 app = FastAPI(title="ghostmeet-backend", version="0.3.0")
 
+# serve demo page (local only, not committed to git)
+_demo_dir = Path(__file__).resolve().parent.parent / "demo"
+if _demo_dir.exists():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/demo", StaticFiles(directory=str(_demo_dir), html=True), name="demo")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -161,14 +167,12 @@ async def ws_audio(websocket: WebSocket):
     )
     transcribers[session_id] = transcriber
 
-    # collect audio
-    chunk_dir = RECORDINGS_DIR / f"{session_id}_chunks"
-    chunk_dir.mkdir(exist_ok=True)
-    chunk_paths: List[Path] = []
-    chunk_num = 0
+    # notify client of session id
+    await websocket.send_json({"session_id": session_id})
+
+    # collect audio — accumulate into one growing file, transcribe periodically
+    last_transcribed_size = 0
     chunk_start_time = asyncio.get_event_loop().time()
-    current_chunk_path = chunk_dir / f"chunk_{chunk_num:04d}.webm"
-    current_chunk_file = current_chunk_path.open("wb")
 
     try:
         with out_path.open("ab") as full_file:
@@ -178,47 +182,36 @@ async def ws_audio(websocket: WebSocket):
                     chunk = message["bytes"]
                     full_file.write(chunk)
                     full_file.flush()
-                    current_chunk_file.write(chunk)
-                    current_chunk_file.flush()
                     session.chunks += 1
                     session.audio_bytes += len(chunk)
 
                     elapsed = asyncio.get_event_loop().time() - chunk_start_time
                     if elapsed >= CHUNK_INTERVAL:
-                        current_chunk_file.close()
-                        chunk_paths.append(current_chunk_path)
-
-                        # transcribe completed chunk in background
-                        logger.info("Chunk %d ready (%.0fs), starting transcription", chunk_num, elapsed)
+                        # transcribe the full accumulated file
+                        logger.info("Interval reached (%.0fs, %d bytes), transcribing...", elapsed, session.audio_bytes)
                         loop = asyncio.get_event_loop()
                         new_segs = await loop.run_in_executor(
-                            None, _do_transcribe, current_chunk_path, transcriber
+                            None, _do_transcribe, out_path, transcriber
                         )
                         if new_segs:
                             session.transcript_segments = len(transcriber.transcript)
                             await _broadcast_segments(session_id, new_segs)
-
-                        chunk_num += 1
+                        last_transcribed_size = session.audio_bytes
                         chunk_start_time = asyncio.get_event_loop().time()
-                        current_chunk_path = chunk_dir / f"chunk_{chunk_num:04d}.webm"
-                        current_chunk_file = current_chunk_path.open("wb")
 
                 elif "text" in message and message["text"] == "stop":
                     break
     except WebSocketDisconnect:
         pass
 
-    # close last chunk file
-    current_chunk_file.close()
-
-    # transcribe the last chunk
-    if current_chunk_path.exists() and current_chunk_path.stat().st_size > 0:
+    # transcribe remaining audio if new data arrived since last transcription
+    if session.audio_bytes > last_transcribed_size and out_path.exists() and out_path.stat().st_size > 0:
         session.status = "transcribing"
-        logger.info("Transcribing final chunk %d (%d bytes)...", chunk_num, current_chunk_path.stat().st_size)
+        logger.info("Transcribing final audio (%d bytes)...", out_path.stat().st_size)
 
         loop = asyncio.get_event_loop()
         new_segs = await loop.run_in_executor(
-            None, _do_transcribe, current_chunk_path, transcriber
+            None, _do_transcribe, out_path, transcriber
         )
         if new_segs:
             session.transcript_segments = len(transcriber.transcript)

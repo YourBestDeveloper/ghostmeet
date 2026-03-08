@@ -21,3 +21,8 @@ recordings/
 
 # OS
 .DS_Store
+demo/
+
+requirements.md
+requirements-demo.md
+IMPLEMENTATION_PLAN.md
