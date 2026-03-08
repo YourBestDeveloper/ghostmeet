@@ -5,7 +5,8 @@ metadata:
   {
     "openclaw": {
       "emoji": "👻",
-      "requires": { "anyBins": ["docker", "curl"] }
+      "requires": { "anyBins": ["docker", "curl"] },
+      "envHints": ["GHOSTMEET_ANTHROPIC_KEY"]
     }
   }
 ---
@@ -138,6 +139,13 @@ User: "How many meetings did I have today?"
 4. **Format transcripts nicely** — don't dump raw JSON, present as readable conversation
 5. **Respect privacy** — meeting transcripts are sensitive. Never share outside the current chat
 6. **If backend is down** — suggest `docker compose up -d` in the ghostmeet directory
+
+## Privacy
+
+- **Transcription is 100% local** — Whisper runs on your machine, audio never leaves your device
+- **Summaries use Anthropic API** — when you click Summarize, transcript text is sent to Claude API. If you don't want this, skip the summarize feature; transcription works without it
+- **Chrome Extension captures tab audio only** — uses `chrome.tabCapture` API, limited to the active tab. It cannot access other tabs, microphone, or system audio. Audit the extension source in `extension/` before installing
+- **No telemetry** — ghostmeet sends zero analytics or tracking data
 
 ## Troubleshooting
 
