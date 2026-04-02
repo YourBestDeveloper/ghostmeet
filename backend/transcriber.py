@@ -38,17 +38,21 @@ class Transcriber:
         device: str = "auto",
         compute_type: str = "float32",
         language: str | None = None,
+        model: WhisperModel | None = None,
     ):
-        logger.info("Loading whisper model: %s (device=%s, compute=%s)", model_size, device, compute_type)
-        self.model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-        )
+        if model is not None:
+            self.model = model
+        else:
+            logger.info("Loading whisper model: %s (device=%s, compute=%s)", model_size, device, compute_type)
+            self.model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type=compute_type,
+            )
+            logger.info("Whisper model loaded successfully")
         self.language = language
         self.transcript: List[Segment] = []
         self._offset: float = 0.0
-        logger.info("Whisper model loaded successfully")
 
     def transcribe_chunk(self, pcm_bytes: bytes) -> List[Segment]:
         """Transcribe a chunk of raw PCM audio (16kHz, 16-bit, mono).

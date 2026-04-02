@@ -5,12 +5,14 @@ import asyncio
 import datetime as dt
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from faster_whisper import WhisperModel
 
 from .audio_processor import transcribe_webm_file
 from .models import Session
@@ -30,7 +32,23 @@ WHISPER_DEVICE = os.environ.get("GHOSTMEET_DEVICE", "auto")
 WHISPER_LANGUAGE = os.environ.get("GHOSTMEET_LANGUAGE", None) or None  # empty string → None
 CHUNK_INTERVAL = int(os.environ.get("GHOSTMEET_CHUNK_INTERVAL", "300"))
 
-app = FastAPI(title="ghostmeet-backend", version="0.3.0")
+_shared_model: WhisperModel | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _shared_model
+    logger.info("Loading whisper model: %s (device=%s)", WHISPER_MODEL, WHISPER_DEVICE)
+    loop = asyncio.get_event_loop()
+    _shared_model = await loop.run_in_executor(
+        None,
+        lambda: WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="float32"),
+    )
+    logger.info("Whisper model loaded successfully")
+    yield
+
+
+app = FastAPI(title="ghostmeet-backend", version="0.3.0", lifespan=lifespan)
 
 # serve demo page (local only, not committed to git)
 _demo_dir = Path(__file__).resolve().parent.parent / "demo"
@@ -161,14 +179,16 @@ async def ws_audio(websocket: WebSocket):
     sessions[session_id] = session
 
     transcriber = Transcriber(
-        model_size=WHISPER_MODEL,
-        device=WHISPER_DEVICE,
+        model=_shared_model,
         language=WHISPER_LANGUAGE,
     )
     transcribers[session_id] = transcriber
 
     # notify client of session id
-    await websocket.send_json({"session_id": session_id})
+    try:
+        await websocket.send_json({"session_id": session_id})
+    except Exception:
+        return  # client disconnected before we could respond
 
     # collect audio — accumulate into one growing file, transcribe periodically
     last_transcribed_size = 0
