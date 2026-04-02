@@ -1,0 +1,81 @@
+let mediaRecorder = null;
+let mediaStream = null;
+let socket = null;
+
+async function startCapture(streamId, sessionId) {
+  if (mediaRecorder) return;
+
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'tab',
+          chromeMediaSourceId: streamId,
+        },
+      },
+      video: false,
+    });
+  } catch (e) {
+    return;
+  }
+
+  socket = new WebSocket(`ws://127.0.0.1:8877/ws/audio?session=${sessionId}`);
+  socket.binaryType = 'arraybuffer';
+
+  socket.onopen = () => {
+    try {
+      mediaRecorder = new MediaRecorder(mediaStream, {
+        mimeType: 'audio/webm;codecs=opus',
+        audioBitsPerSecond: 128000,
+      });
+    } catch (e) {
+      return;
+    }
+
+    mediaRecorder.ondataavailable = async (event) => {
+      if (!event.data || event.data.size === 0) return;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        const buf = await event.data.arrayBuffer();
+        socket.send(buf);
+      }
+    };
+
+    mediaRecorder.start(1000);
+  };
+}
+
+async function stopCapture() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+  }
+  mediaRecorder = null;
+
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+  }
+
+  if (socket) {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send('stop');
+      socket.close();
+    }
+    socket = null;
+  }
+
+  chrome.offscreen.closeDocument();
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.target !== 'offscreen') return false;
+
+  if (message.action === 'start_capture') {
+    startCapture(message.streamId, message.sessionId);
+    sendResponse({ ok: true });
+  } else if (message.action === 'stop_capture') {
+    stopCapture();
+    sendResponse({ ok: true });
+  }
+
+  return false;
+});
