@@ -6,10 +6,16 @@
       body { font-family: -apple-system, sans-serif; width: 280px; padding: 12px; }
       button { width: 100%; margin-bottom: 8px; padding: 10px; }
       #status { font-size: 12px; color: #555; white-space: pre-wrap; }
+      .sources { margin-bottom: 10px; display: flex; gap: 16px; }
+      .sources label { font-size: 13px; display: flex; align-items: center; gap: 5px; cursor: pointer; }
     </style>
   </head>
   <body>
     <h3>ghostmeet capture</h3>
+    <div class="sources">
+      <label><input type="checkbox" id="srcTab" checked /> Tab audio</label>
+      <label><input type="checkbox" id="srcMic" checked /> Microphone</label>
+    </div>
     <button id="startBtn">Start capture</button>
     <button id="stopBtn">Stop capture</button>
     <div id="status">idle</div>

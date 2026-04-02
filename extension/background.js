@@ -16,19 +16,27 @@ async function ensureOffscreenDocument() {
   });
 }
 
-async function startCapture() {
+async function startCapture(sources) {
   if (sessionId) {
     return { ok: false, error: 'already capturing', sessionId };
   }
 
-  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (!tab) return { ok: false, error: 'no active tab found' };
+  const captureTab = sources?.tab !== false;
+  const captureMic = sources?.mic === true;
 
-  let streamId;
-  try {
-    streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
-  } catch (e) {
-    return { ok: false, error: `getMediaStreamId failed: ${e.message}` };
+  if (!captureTab && !captureMic) {
+    return { ok: false, error: 'at least one source must be selected' };
+  }
+
+  let streamId = null;
+  if (captureTab) {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tab) return { ok: false, error: 'no active tab found' };
+    try {
+      streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+    } catch (e) {
+      return { ok: false, error: `getMediaStreamId failed: ${e.message}` };
+    }
   }
 
   sessionId = newSessionId();
@@ -41,6 +49,7 @@ async function startCapture() {
     action: 'start_capture',
     streamId,
     sessionId,
+    sources: { tab: captureTab, mic: captureMic },
   });
 
   return { ok: true, sessionId, message: 'capture started' };
@@ -60,6 +69,7 @@ async function stopCapture() {
   const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
   if (existing.length > 0) {
     await chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop_capture' });
+    await chrome.offscreen.closeDocument();
   }
 
   return { ok: true, sessionId: stoppedSession, message: 'capture stopped' };
@@ -70,7 +80,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   (async () => {
     if (message.action === 'start_capture') {
-      sendResponse(await startCapture());
+      sendResponse(await startCapture(message.sources));
       return;
     }
 

@@ -1,7 +1,13 @@
 const statusEl = document.getElementById('status');
 
 async function send(action) {
-  const response = await chrome.runtime.sendMessage({ action });
+  const sources = action === 'start_capture'
+    ? {
+        tab: document.getElementById('srcTab').checked,
+        mic: document.getElementById('srcMic').checked,
+      }
+    : undefined;
+  const response = await chrome.runtime.sendMessage({ action, sources });
   if (!response) {
     statusEl.textContent = 'no response from background';
     return;
