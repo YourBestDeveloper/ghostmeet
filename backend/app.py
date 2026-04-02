@@ -137,6 +137,8 @@ async def ws_transcript(websocket: WebSocket, session_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
+    except Exception as exc:
+        logger.warning("ws_transcript: connection lost abnormally (%s)", exc)
     finally:
         transcript_subscribers.get(session_id, []).remove(websocket)
 
@@ -223,6 +225,8 @@ async def ws_audio(websocket: WebSocket):
                     break
     except WebSocketDisconnect:
         pass
+    except Exception as exc:
+        logger.warning("ws_audio: connection lost abnormally (%s)", exc)
 
     # transcribe remaining audio if new data arrived since last transcription
     if session.audio_bytes > last_transcribed_size and out_path.exists() and out_path.stat().st_size > 0:
