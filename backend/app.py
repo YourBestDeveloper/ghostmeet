@@ -5,6 +5,7 @@ import asyncio
 import datetime as dt
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List
@@ -14,7 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
-from .audio_processor import transcribe_webm_file
+from .audio_processor import transcribe_webm_incremental
 from .models import Session
 from .summarizer import Summary, generate_summary
 from .transcriber import Transcriber, Segment
@@ -156,13 +157,47 @@ async def _broadcast_segments(session_id: str, segments: List[Segment]):
         subs.remove(ws)
 
 
-def _do_transcribe(chunk_path: Path, transcriber: Transcriber) -> list:
-    """Synchronous transcription — runs in executor thread."""
-    try:
-        return transcribe_webm_file(chunk_path, transcriber)
-    except Exception as e:
-        logger.error("Transcription failed for %s: %s", chunk_path, e, exc_info=True)
+# WebM Cluster element ID — marks the start of actual audio data in the container.
+# Everything before the first Cluster is the pure header (EBML + Tracks).
+_WEBM_CLUSTER_ID = b'\x1f\x43\xb6\x75'
+
+
+def _extract_webm_header(first_chunk: bytes) -> bytes:
+    """Return the portion of the first webm chunk before the first Cluster element.
+
+    The result (EBML + Segment header + Tracks, no audio data) can be prepended to
+    any subsequent cluster bytes to produce a decodable webm file.
+    """
+    idx = first_chunk.find(_WEBM_CLUSTER_ID)
+    if idx < 0:
+        logger.warning("Cluster element not found in first webm chunk; cannot extract header")
+        return b''
+    return first_chunk[:idx]
+
+
+def _do_transcribe_incremental(chunk_data: bytes, transcriber: Transcriber, time_offset: float) -> list:
+    """Synchronous incremental transcription — runs in executor thread.
+
+    chunk_data: complete webm bytes to transcribe (header already embedded).
+    time_offset: seconds to add to all returned segment timestamps.
+    """
+    if not chunk_data:
         return []
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as f:
+            f.write(chunk_data)
+            tmp_path = f.name
+        return transcribe_webm_incremental(tmp_path, transcriber, time_offset)
+    except Exception as e:
+        logger.error("Incremental transcription failed: %s", e, exc_info=True)
+        return []
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.websocket("/ws/audio")
@@ -174,27 +209,44 @@ async def ws_audio(websocket: WebSocket):
         session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     out_path = RECORDINGS_DIR / f"{session_id}.webm"
-    session = Session(
-        session_id=session_id,
-        file=str(out_path.relative_to(ROOT)),
-    )
-    sessions[session_id] = session
 
-    transcriber = Transcriber(
-        model=_shared_model,
-        language=WHISPER_LANGUAGE,
-    )
-    transcribers[session_id] = transcriber
+    existing_session = session_id in sessions
+    if not existing_session:
+        session = Session(
+            session_id=session_id,
+            file=str(out_path.relative_to(ROOT)),
+        )
+        sessions[session_id] = session
+        transcriber = Transcriber(
+            model=_shared_model,
+            language=WHISPER_LANGUAGE,
+        )
+        transcribers[session_id] = transcriber
+    else:
+        session = sessions[session_id]
+        session.status = "streaming"
+        transcriber = transcribers[session_id]
+        logger.info(
+            "Reconnect: reusing session %s (%d segments, %d bytes so far)",
+            session_id, len(transcriber.transcript), session.audio_bytes,
+        )
+
+    # Per-connection ID: only the most recent connection should mark the session stopped.
+    # Uses a plain counter stored as a dynamic attribute (no model change needed).
+    session.connection_count = getattr(session, "connection_count", 0) + 1
+    my_connection = session.connection_count
 
     # notify client of session id
     try:
-        await websocket.send_json({"session_id": session_id})
+        await websocket.send_json({"session_id": session_id, "reconnected": existing_session})
     except Exception:
         return  # client disconnected before we could respond
 
     # collect audio — accumulate into one growing file, transcribe periodically
-    last_transcribed_size = 0
-    chunk_start_time = asyncio.get_event_loop().time()
+    # Preserve elapsed time across reconnects so the CHUNK_INTERVAL doesn't reset
+    now = asyncio.get_event_loop().time()
+    chunk_start_time = getattr(session, "chunk_start_time", now)
+    session.chunk_start_time = chunk_start_time
 
     try:
         with out_path.open("ab") as full_file:
@@ -207,19 +259,44 @@ async def ws_audio(websocket: WebSocket):
                     session.chunks += 1
                     session.audio_bytes += len(chunk)
 
+                    # Store webm header from the very first chunk (EBML + Tracks, no audio).
+                    # Used to prefix incremental chunk files so they are self-contained webm files.
+                    if getattr(session, "webm_header_bytes", None) is None:
+                        header = _extract_webm_header(chunk)
+                        if header:
+                            session.webm_header_bytes = header
+
                     elapsed = asyncio.get_event_loop().time() - chunk_start_time
                     if elapsed >= CHUNK_INTERVAL:
-                        # transcribe the full accumulated file
-                        logger.info("Interval reached (%.0fs, %d bytes), transcribing...", elapsed, session.audio_bytes)
+                        last_offset = getattr(session, "last_transcribed_offset", 0)
+                        file_size = out_path.stat().st_size
+                        chunks_at_trigger = session.chunks  # snapshot before any await
+                        with out_path.open("rb") as rf:
+                            rf.seek(last_offset)
+                            new_bytes = rf.read()
+                        header_bytes = getattr(session, "webm_header_bytes", None)
+                        if last_offset == 0:
+                            chunk_data = new_bytes  # entire file already has EBML header
+                        elif header_bytes:
+                            chunk_data = header_bytes + new_bytes
+                        else:
+                            chunk_data = b""
+                        time_offset = getattr(session, "last_transcribed_chunk_count", 0) * 1.0
+                        logger.info(
+                            "Interval reached (%.0fs, %d new bytes, offset=%.1fs), transcribing...",
+                            elapsed, len(new_bytes), time_offset,
+                        )
                         loop = asyncio.get_event_loop()
                         new_segs = await loop.run_in_executor(
-                            None, _do_transcribe, out_path, transcriber
+                            None, _do_transcribe_incremental, chunk_data, transcriber, time_offset
                         )
                         if new_segs:
                             session.transcript_segments = len(transcriber.transcript)
                             await _broadcast_segments(session_id, new_segs)
-                        last_transcribed_size = session.audio_bytes
+                        session.last_transcribed_offset = file_size
+                        session.last_transcribed_chunk_count = chunks_at_trigger
                         chunk_start_time = asyncio.get_event_loop().time()
+                        session.chunk_start_time = chunk_start_time
 
                 elif "text" in message and message["text"] == "stop":
                     break
@@ -228,14 +305,37 @@ async def ws_audio(websocket: WebSocket):
     except Exception as exc:
         logger.warning("ws_audio: connection lost abnormally (%s)", exc)
 
+    # Only the most recent connection should finalize the session.
+    # A stale handler (superseded by reconnect) skips cleanup to avoid
+    # clobbering session.status and running a concurrent final transcription.
+    if session.connection_count != my_connection:
+        logger.info(
+            "ws_audio: stale handler for session %s (connection %d, current %d) — skipping cleanup",
+            session_id, my_connection, session.connection_count,
+        )
+        return
+
     # transcribe remaining audio if new data arrived since last transcription
-    if session.audio_bytes > last_transcribed_size and out_path.exists() and out_path.stat().st_size > 0:
+    file_size = out_path.stat().st_size if out_path.exists() else 0
+    last_offset = getattr(session, "last_transcribed_offset", 0)
+    if file_size > last_offset:
         session.status = "transcribing"
-        logger.info("Transcribing final audio (%d bytes)...", out_path.stat().st_size)
+        with out_path.open("rb") as rf:
+            rf.seek(last_offset)
+            new_bytes = rf.read()
+        header_bytes = getattr(session, "webm_header_bytes", None)
+        if last_offset == 0:
+            chunk_data = new_bytes
+        elif header_bytes:
+            chunk_data = header_bytes + new_bytes
+        else:
+            chunk_data = b""
+        time_offset = getattr(session, "last_transcribed_chunk_count", 0) * 1.0
+        logger.info("Transcribing final audio (%d new bytes, offset=%.1fs)...", len(new_bytes), time_offset)
 
         loop = asyncio.get_event_loop()
         new_segs = await loop.run_in_executor(
-            None, _do_transcribe, out_path, transcriber
+            None, _do_transcribe_incremental, chunk_data, transcriber, time_offset
         )
         if new_segs:
             session.transcript_segments = len(transcriber.transcript)
