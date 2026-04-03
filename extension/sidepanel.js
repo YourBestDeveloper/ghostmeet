@@ -11,6 +11,7 @@ const emptyStateEl = document.getElementById('empty-state');
 const segmentCountEl = document.getElementById('segment-count');
 const durationEl = document.getElementById('duration');
 const btnClear = document.getElementById('btn-clear');
+const btnCopy = document.getElementById('btn-copy');
 
 // --- capture controls ---
 
@@ -454,6 +455,15 @@ function markdownToHtml(md) {
     .replace(/\n/g, '<br>');
 }
 
-// --- clear button ---
+// --- clear / copy buttons ---
 
 btnClear.addEventListener('click', clearTranscript);
+
+btnCopy.addEventListener('click', async () => {
+  const texts = [...transcriptEl.querySelectorAll('.segment .text')].map((el) => el.textContent).join('\n');
+  if (!texts) return;
+  await navigator.clipboard.writeText(texts);
+  const prev = btnCopy.textContent;
+  btnCopy.textContent = '✅';
+  setTimeout(() => { btnCopy.textContent = prev; }, 1200);
+});

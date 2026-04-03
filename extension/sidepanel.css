@@ -142,6 +142,19 @@ body {
   font-size: 12px;
 }
 
+#btn-copy,
+#btn-clear {
+  padding: 6px 9px;
+  font-size: 14px;
+}
+
+.controls-divider {
+  width: 1px;
+  background: #2a2a4a;
+  align-self: stretch;
+  margin: 2px 0;
+}
+
 #controls button:hover {
   background: #3a3a5a;
 }
