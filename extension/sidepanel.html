@@ -12,6 +12,17 @@
     <div id="status" class="status disconnected">disconnected</div>
   </div>
 
+  <div id="capture-controls">
+    <div class="source-row">
+      <label><input type="radio" name="audioSource" id="srcMic" value="mic" checked /> Microphone</label>
+      <label><input type="radio" name="audioSource" id="srcTab" value="tab" /> Tab audio</label>
+    </div>
+    <div class="capture-btn-row">
+      <button id="btn-start">▶ Start</button>
+      <button id="btn-stop" disabled>⏹ Stop</button>
+    </div>
+  </div>
+
   <div id="controls">
     <select id="language">
       <option value="">Auto-detect</option>
@@ -28,7 +39,6 @@
     <div id="transcript"></div>
     <div id="empty-state">
       <p>🎧 Start capturing audio to see live captions</p>
-      <p class="hint">Click the extension popup → Start Capture</p>
     </div>
   </div>
 

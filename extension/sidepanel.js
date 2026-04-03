@@ -12,6 +12,218 @@ const segmentCountEl = document.getElementById('segment-count');
 const durationEl = document.getElementById('duration');
 const btnClear = document.getElementById('btn-clear');
 
+// --- capture controls ---
+
+const srcTabEl = document.getElementById('srcTab');
+const srcMicEl = document.getElementById('srcMic');
+const btnStart = document.getElementById('btn-start');
+const btnStop = document.getElementById('btn-stop');
+let localTabStream = null;
+let localDisplayStream = null;
+let localTabAudioCtx = null;
+let localSocket = null;
+let localRecorder = null;
+let localSessionId = null;
+
+function setCaptureState(state) {
+  const sourceLocked = state === true || state === 'starting';
+  srcTabEl.disabled = sourceLocked;
+  srcMicEl.disabled = sourceLocked;
+  btnStart.disabled = state === true || state === 'starting';
+  btnStop.disabled = state !== true;
+  if (state === 'starting') setStatus('connecting', 'starting...');
+}
+
+function newLocalSessionId() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+async function getCurrentCapturableTab() {
+  const isCapturableUrl = (url) => {
+    if (!url) return false;
+    return /^(https?:\/\/|file:\/\/)/i.test(url);
+  };
+
+  const lastFocused = await chrome.windows.getLastFocused().catch(() => null);
+  const focusedTabs = lastFocused?.id
+    ? await chrome.tabs.query({ windowId: lastFocused.id })
+    : [];
+  const activeInFocused = focusedTabs.find((t) => t.active);
+
+  // Prefer currently active capturable tab in focused window.
+  let tab = activeInFocused && isCapturableUrl(activeInFocused.url) ? activeInFocused : null;
+
+  // Fallback: most recently accessed capturable tab in focused window.
+  if (!tab) {
+    const candidates = focusedTabs
+      .filter((t) => isCapturableUrl(t.url))
+      .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    if (candidates.length) tab = candidates[0];
+  }
+
+  // Last resort: any active capturable tab from other windows.
+  if (!tab) {
+    const activeTabs = await chrome.tabs.query({ active: true });
+    tab = activeTabs.find((t) => isCapturableUrl(t.url)) || null;
+  }
+
+  // Diagnostic fallback for clearer user message.
+  if (!tab) {
+    tab = activeInFocused || focusedTabs[0] || null;
+  }
+
+  if (!tab?.id) throw new Error('no active tab found');
+  if (!isCapturableUrl(tab.url)) {
+    throw new Error(`cannot capture this tab (${tab.url || 'unknown url'}). switch to an http(s) tab`);
+  }
+  return tab;
+}
+
+async function startLocalTabOnlyCapture(sessionId) {
+  const displayStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: true,
+  });
+  const audioTracks = displayStream.getAudioTracks();
+  if (!audioTracks.length) {
+    displayStream.getTracks().forEach((t) => t.stop());
+    throw new Error('selected tab has no audio. choose a tab and enable share audio');
+  }
+  localDisplayStream = displayStream;
+  localTabAudioCtx = new AudioContext();
+  await localTabAudioCtx.resume();
+  const destination = localTabAudioCtx.createMediaStreamDestination();
+  localTabAudioCtx.createMediaStreamSource(localDisplayStream).connect(destination);
+
+  localTabStream = destination.stream;
+  localSocket = new WebSocket(`ws://${BACKEND_URL}/ws/audio?session=${sessionId}`);
+  localSocket.binaryType = 'arraybuffer';
+  await new Promise((resolve, reject) => {
+    localSocket.onopen = resolve;
+    localSocket.onerror = () => reject(new Error('websocket connection failed'));
+  });
+
+  localRecorder = new MediaRecorder(localTabStream, {
+    mimeType: 'audio/webm;codecs=opus',
+    audioBitsPerSecond: 128000,
+  });
+  localRecorder.ondataavailable = async (event) => {
+    if (!event.data || event.data.size === 0) return;
+    if (localSocket && localSocket.readyState === WebSocket.OPEN) {
+      localSocket.send(await event.data.arrayBuffer());
+    }
+  };
+  localRecorder.start(1000);
+}
+
+function stopLocalTabOnlyCapture() {
+  if (localRecorder && localRecorder.state !== 'inactive') localRecorder.stop();
+  localRecorder = null;
+
+  if (localTabStream) {
+    localTabStream.getTracks().forEach((t) => t.stop());
+    localTabStream = null;
+  }
+  if (localDisplayStream) {
+    localDisplayStream.getTracks().forEach((t) => t.stop());
+    localDisplayStream = null;
+  }
+  if (localTabAudioCtx) {
+    localTabAudioCtx.close().catch(() => {});
+    localTabAudioCtx = null;
+  }
+
+  if (localSocket) {
+    if (localSocket.readyState === WebSocket.OPEN) {
+      localSocket.send('stop');
+      localSocket.close();
+    }
+    localSocket = null;
+  }
+}
+
+btnStart.addEventListener('click', async () => {
+  if (btnStart.disabled) return;
+
+  const source = srcTabEl.checked ? 'tab' : 'mic';
+  const sources = { tab: source === 'tab', mic: source === 'mic' };
+  if (!sources.tab && !sources.mic) {
+    setStatus('disconnected', 'select at least one source');
+    return;
+  }
+
+  // Always start from a clean state before requesting new capture.
+  disconnect();
+  setCaptureState('starting');
+  setStatus('connecting', sources.mic ? 'opening mic permission flow...' : 'starting...');
+
+  // Fast path: tab-only capture without getMediaStreamId/offscreen invocation.
+  if (sources.tab && !sources.mic) {
+    try {
+      localSessionId = newLocalSessionId();
+      setStatus('connecting', 'choose a tab in browser picker...');
+      await startLocalTabOnlyCapture(localSessionId);
+      await chrome.storage.local.set({ activeSessionId: localSessionId });
+      setCaptureState(true);
+      connectTranscript(localSessionId);
+      return;
+    } catch (e) {
+      stopLocalTabOnlyCapture();
+      localSessionId = null;
+      setCaptureState(false);
+      setStatus('disconnected', e?.message || 'tab-only capture failed');
+      await chrome.storage.local.remove('activeSessionId');
+      return;
+    }
+  }
+
+  let streamId;
+  let targetTabId;
+  if (sources.tab) {
+    try {
+      const targetTab = await getCurrentCapturableTab();
+      targetTabId = targetTab.id;
+    } catch (e) {
+      setCaptureState(false);
+      setStatus('disconnected', e?.message || 'failed to get tab stream id');
+      return;
+    }
+  }
+
+  const currentWindow = await chrome.windows.getCurrent().catch(() => null);
+  const response = await chrome.runtime.sendMessage({
+    action: 'start_capture',
+    sources,
+    streamId,
+    targetTabId,
+    requesterWindowId: currentWindow?.id,
+  }).catch(() => null);
+  if (!response || response.ok === false) {
+    setCaptureState(false);
+    setStatus('disconnected', response?.error || 'failed to start capture');
+    chrome.storage.local.remove('activeSessionId');
+  } else if (response.pending) {
+    setStatus('connecting', 'waiting for microphone permission tab...');
+  }
+});
+
+btnStop.addEventListener('click', async () => {
+  btnStop.disabled = true;
+  if (localSessionId) {
+    stopLocalTabOnlyCapture();
+    localSessionId = null;
+    await chrome.storage.local.remove('activeSessionId');
+    disconnect();
+    setCaptureState(false);
+    return;
+  }
+  await chrome.runtime.sendMessage({ action: 'stop_capture' });
+  disconnect();
+  setCaptureState(false);
+});
+
 // --- helpers ---
 
 function formatTime(seconds) {
@@ -135,14 +347,31 @@ function disconnect() {
 // --- listen for messages from background/popup ---
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.action === 'transcript_start' && message.sessionId) {
+  if (message.action === 'capture_error') {
+    setCaptureState(false);
+    setStatus('disconnected', message.error || 'capture failed');
+    chrome.storage.local.remove('activeSessionId');
+    disconnect();
+    sendResponse({ ok: true });
+  } else if (message.action === 'mic_permission_required') {
+    setStatus('connecting', 'allow microphone in opened permission tab');
+    sendResponse({ ok: true });
+  } else if (message.action === 'capture_info') {
+    setStatus('connecting', message.message || 'processing capture flow...');
+    sendResponse({ ok: true });
+  } else if (message.action === 'transcript_start' && message.sessionId) {
+    setCaptureState(true);
     connectTranscript(message.sessionId);
     sendResponse({ ok: true });
   } else if (message.action === 'transcript_stop') {
     disconnect();
+    stopLocalTabOnlyCapture();
+    localSessionId = null;
+    setCaptureState(false);
     sendResponse({ ok: true });
+    return true;
   }
-  return true;
+  return false;
 });
 
 // --- on load: check if there's an active session ---

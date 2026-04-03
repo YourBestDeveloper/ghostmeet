@@ -1,36 +1,25 @@
 const statusEl = document.getElementById('status');
 
 async function send(action) {
-  const sources = action === 'start_capture'
-    ? {
-        tab: document.getElementById('srcTab').checked,
-        mic: document.getElementById('srcMic').checked,
-      }
-    : undefined;
-  const response = await chrome.runtime.sendMessage({ action, sources });
-  if (!response) {
-    statusEl.textContent = 'no response from background';
+  if (action === 'start_capture') {
+    if (!chrome.sidePanel) {
+      statusEl.textContent = 'side panel API is unavailable';
+      return;
+    }
+    const currentWindow = await chrome.windows.getCurrent();
+    await chrome.sidePanel.open({ windowId: currentWindow.id });
+    statusEl.textContent = 'Use Start in side panel to begin capture.';
     return;
   }
-  statusEl.textContent = JSON.stringify(response, null, 2);
 
-  // on successful start, store session ID and notify side panel
-  if (response.ok && action === 'start_capture' && response.sessionId) {
-    chrome.storage.local.set({ activeSessionId: response.sessionId });
-    chrome.runtime.sendMessage({
-      action: 'transcript_start',
-      sessionId: response.sessionId,
-    }).catch(() => {});
-    // open side panel
-    if (chrome.sidePanel) {
-      chrome.sidePanel.open({ windowId: (await chrome.windows.getCurrent()).id }).catch(() => {});
+  if (action === 'stop_capture') {
+    const response = await chrome.runtime.sendMessage({ action });
+    if (!response) { statusEl.textContent = 'no response from background'; return; }
+    statusEl.textContent = JSON.stringify(response, null, 2);
+    if (response.ok) {
+      chrome.storage.local.remove('activeSessionId');
+      chrome.runtime.sendMessage({ action: 'transcript_stop' }).catch(() => {});
     }
-  }
-
-  // on stop, clear session and notify side panel
-  if (response.ok && action === 'stop_capture') {
-    chrome.storage.local.remove('activeSessionId');
-    chrome.runtime.sendMessage({ action: 'transcript_stop' }).catch(() => {});
   }
 }
 

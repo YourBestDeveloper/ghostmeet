@@ -4,13 +4,34 @@ let micStream = null;
 let audioContext = null;
 let socket = null;
 
+function reportError(error) {
+  console.error('[offscreen]', error);
+  chrome.runtime.sendMessage({ action: 'capture_error', error }).catch(() => {});
+}
+
+function normalizeCaptureError(prefix, error) {
+  const name = error?.name || '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return `${prefix}: mic permission denied or blocked in browser settings`;
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return `${prefix}: no microphone device found`;
+  }
+  return `${prefix}: ${error?.message || 'unknown error'}`;
+}
+
 async function startCapture(streamId, sessionId, sources) {
-  if (mediaRecorder) return;
+  if (mediaRecorder) throw new Error('already capturing');
 
   const captureTab = sources?.tab !== false && streamId;
   const captureMic = sources?.mic === true;
 
+  console.log('[offscreen] startCapture', { captureTab: !!captureTab, captureMic, streamId: !!streamId });
+
   audioContext = new AudioContext();
+  await audioContext.resume();
+  console.log('[offscreen] AudioContext state:', audioContext.state, 'sampleRate:', audioContext.sampleRate);
+
   const destination = audioContext.createMediaStreamDestination();
 
   if (captureTab) {
@@ -24,46 +45,78 @@ async function startCapture(streamId, sessionId, sources) {
         },
         video: false,
       });
+      const tabTrack = tabStream.getAudioTracks()[0];
+      console.log('[offscreen] tabStream ok, track:', tabTrack?.label, 'enabled:', tabTrack?.enabled, 'readyState:', tabTrack?.readyState);
       audioContext.createMediaStreamSource(tabStream).connect(destination);
     } catch (e) {
-      // tab stream 실패 시 계속 진행
+      const error = normalizeCaptureError('tab capture failed', e);
+      await stopCapture();
+      reportError(error);
+      throw new Error(error);
     }
   }
 
   if (captureMic) {
     try {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const micTrack = micStream.getAudioTracks()[0];
+      console.log('[offscreen] micStream ok, track:', micTrack?.label, 'enabled:', micTrack?.enabled, 'readyState:', micTrack?.readyState);
       audioContext.createMediaStreamSource(micStream).connect(destination);
     } catch (e) {
-      // 마이크 권한 거부 시 무시
+      const error = normalizeCaptureError('mic capture failed', e);
+      await stopCapture();
+      reportError(error);
+      throw new Error(error);
     }
   }
+
+  const destTracks = destination.stream.getAudioTracks();
+  console.log('[offscreen] destination tracks:', destTracks.length, 'enabled:', destTracks[0]?.enabled);
 
   const mixedStream = destination.stream;
 
   socket = new WebSocket(`ws://127.0.0.1:8877/ws/audio?session=${sessionId}`);
   socket.binaryType = 'arraybuffer';
 
-  socket.onopen = () => {
-    try {
-      mediaRecorder = new MediaRecorder(mixedStream, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 128000,
-      });
-    } catch (e) {
-      return;
-    }
-
-    mediaRecorder.ondataavailable = async (event) => {
-      if (!event.data || event.data.size === 0) return;
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        const buf = await event.data.arrayBuffer();
-        socket.send(buf);
-      }
+  await new Promise((resolve, reject) => {
+    const onOpen = () => {
+      socket.removeEventListener('error', onError);
+      resolve();
     };
+    const onError = () => {
+      socket.removeEventListener('open', onOpen);
+      reject(new Error('websocket connection failed (is backend running on 127.0.0.1:8877?)'));
+    };
+    socket.addEventListener('open', onOpen, { once: true });
+    socket.addEventListener('error', onError, { once: true });
+  });
 
-    mediaRecorder.start(1000);
+  console.log('[offscreen] WebSocket open');
+  try {
+    mediaRecorder = new MediaRecorder(mixedStream, {
+      mimeType: 'audio/webm;codecs=opus',
+      audioBitsPerSecond: 128000,
+    });
+  } catch (e) {
+    const error = `MediaRecorder init failed: ${e.message}`;
+    await stopCapture();
+    reportError(error);
+    throw new Error(error);
+  }
+
+  let chunkCount = 0;
+  mediaRecorder.ondataavailable = async (event) => {
+    chunkCount++;
+    console.log(`[offscreen] chunk #${chunkCount} size:`, event.data?.size);
+    if (!event.data || event.data.size === 0) return;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      const buf = await event.data.arrayBuffer();
+      socket.send(buf);
+    }
   };
+
+  mediaRecorder.start(1000);
+  console.log('[offscreen] MediaRecorder started, state:', mediaRecorder.state);
 }
 
 async function stopCapture() {
@@ -100,11 +153,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.target !== 'offscreen') return false;
 
   if (message.action === 'start_capture') {
-    startCapture(message.streamId, message.sessionId, message.sources);
-    sendResponse({ ok: true });
-  } else if (message.action === 'stop_capture') {
-    stopCapture();
-    sendResponse({ ok: true });
+    (async () => {
+      try {
+        await startCapture(message.streamId, message.sessionId, message.sources);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || 'offscreen start failed' });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'stop_capture') {
+    (async () => {
+      try {
+        await stopCapture();
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || 'offscreen stop failed' });
+      }
+    })();
+    return true;
   }
 
   return false;
