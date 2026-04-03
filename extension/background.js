@@ -260,6 +260,24 @@ async function stopCapture() {
   return { ok: true, sessionId: stoppedSession, message: 'capture stopped' };
 }
 
+async function getCaptureState() {
+  // Treat capture as active only when runtime state has a live session and
+  // an active capture context exists (offscreen or mic-permission fallback tab).
+  const active = sessionId || null;
+  if (!active) return { ok: true, capturing: false, sessionId: null };
+
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).catch(() => []);
+  const hasOffscreen = Array.isArray(contexts) && contexts.length > 0;
+  const hasMicFallback = !!micCaptureSessionId;
+  const capturing = hasOffscreen || hasMicFallback;
+
+  return {
+    ok: true,
+    capturing,
+    sessionId: capturing ? active : null,
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'start_capture') {
     sendResponse({ ok: true, pending: true });
@@ -300,6 +318,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'stop_capture') {
     (async () => {
       const result = await stopCapture();
+      try { sendResponse(result); } catch (_) {}
+    })();
+    return true;
+  }
+
+  if (message.action === 'get_capture_state') {
+    (async () => {
+      const result = await getCaptureState();
       try { sendResponse(result); } catch (_) {}
     })();
     return true;

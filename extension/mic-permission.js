@@ -13,6 +13,7 @@ let tabStream = null;
 let micStream = null;
 let audioContext = null;
 let socket = null;
+let currentSessionId = null;
 
 // Chunk queue — same reliable-delivery pattern as offscreen.js
 let chunkQueue = [];
@@ -21,6 +22,51 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let isCapturing = false;
 const MAX_QUEUE_CHUNKS = 60;
+
+function waitForSocketOpen(sock, timeoutMs = 2000) {
+  if (!sock) return Promise.resolve(false);
+  if (sock.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  if (sock.readyState !== WebSocket.CONNECTING) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      sock.removeEventListener('open', onOpen);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(false);
+    }, timeoutMs);
+    const onOpen = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(true);
+    };
+    const onDone = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('open', onOpen);
+      resolve(false);
+    };
+    sock.addEventListener('open', onOpen, { once: true });
+    sock.addEventListener('error', onDone, { once: true });
+    sock.addEventListener('close', onDone, { once: true });
+  });
+}
+
+async function ensureSocketOpenForStop(sid) {
+  if (socket?.readyState === WebSocket.OPEN) return true;
+  if (socket?.readyState === WebSocket.CONNECTING) {
+    const opened = await waitForSocketOpen(socket, 1500);
+    if (opened) return true;
+  }
+  if (!sid) return false;
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:8877/ws/audio?session=${sid}`);
+    socket = ws;
+    ws.binaryType = 'arraybuffer';
+    return await waitForSocketOpen(ws, 1500);
+  } catch (_) {
+    return false;
+  }
+}
 
 function normalizeError(e) {
   if (e?.name === 'NotAllowedError' || e?.name === 'PermissionDeniedError') {
@@ -116,6 +162,7 @@ async function _drainQueue() {
 // ---------------------------------------------------------------------------
 
 async function stopCapture() {
+  const stopSessionId = currentSessionId;
   isCapturing = false;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
@@ -131,12 +178,22 @@ async function stopCapture() {
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
   if (audioContext) { await audioContext.close().catch(() => {}); audioContext = null; }
 
-  if (socket && socket.readyState === WebSocket.OPEN) {
+  const canFlush = await ensureSocketOpenForStop(stopSessionId);
+  if (canFlush && socket && socket.readyState === WebSocket.OPEN) {
     await processQueue(); // waits for any in-flight drain before closing
-    socket.send('stop');
-    socket.close();
+    try {
+      socket.send('stop');
+    } catch (_) {}
+    try {
+      socket.close();
+    } catch (_) {}
+  } else if (socket) {
+    try {
+      socket.close();
+    } catch (_) {}
   }
   socket = null;
+  currentSessionId = null;
   chunkQueue = [];
   _queuePromise = null;
   reconnectAttempts = 0;
@@ -150,6 +207,7 @@ async function startCapture(overrideSessionId, overrideStreamId, overrideCapture
   const effectiveCaptureTab = overrideCaptureTab ?? captureTab;
 
   if (!effectiveSessionId) throw new Error('missing session id');
+  currentSessionId = effectiveSessionId;
 
   audioContext = new AudioContext();
   await audioContext.resume();

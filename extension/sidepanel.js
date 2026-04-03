@@ -25,6 +25,123 @@ let localTabAudioCtx = null;
 let localSocket = null;
 let localRecorder = null;
 let localSessionId = null;
+let localPendingChunks = [];
+let localDrainInFlight = null;
+let localReconnectTimer = null;
+let localReconnectAttempts = 0;
+let localIsCapturing = false;
+const LOCAL_MAX_QUEUE_CHUNKS = 60;
+
+function triggerLocalDrain() {
+  if (localDrainInFlight) return localDrainInFlight;
+  localDrainInFlight = drainLocalQueue().finally(() => {
+    localDrainInFlight = null;
+  });
+  return localDrainInFlight;
+}
+
+async function drainLocalQueue() {
+  while (localPendingChunks.length > 0) {
+    if (!localSocket || localSocket.readyState !== WebSocket.OPEN) break;
+    const blob = localPendingChunks[0];
+    let buf;
+    try {
+      buf = await blob.arrayBuffer();
+    } catch (_) {
+      localPendingChunks.shift();
+      continue;
+    }
+    if (localSocket && localSocket.readyState === WebSocket.OPEN) {
+      localPendingChunks.shift();
+      try {
+        localSocket.send(buf);
+      } catch (_) {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+}
+
+function waitForSocketOpen(sock, timeoutMs = 2000) {
+  if (!sock) return Promise.resolve(false);
+  if (sock.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  if (sock.readyState !== WebSocket.CONNECTING) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      sock.removeEventListener('open', onOpen);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(false);
+    }, timeoutMs);
+    const onOpen = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(true);
+    };
+    const onDone = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('open', onOpen);
+      resolve(false);
+    };
+    sock.addEventListener('open', onOpen, { once: true });
+    sock.addEventListener('error', onDone, { once: true });
+    sock.addEventListener('close', onDone, { once: true });
+  });
+}
+
+async function connectLocalSocket(sessionId) {
+  const wsConn = new WebSocket(`ws://${BACKEND_URL}/ws/audio?session=${sessionId}`);
+  localSocket = wsConn;
+  wsConn.binaryType = 'arraybuffer';
+  const opened = await waitForSocketOpen(wsConn, 3000);
+  if (!opened) throw new Error('websocket connection failed');
+
+  if (!localIsCapturing) {
+    wsConn.close();
+    if (localSocket === wsConn) localSocket = null;
+    return;
+  }
+
+  localReconnectAttempts = 0;
+  triggerLocalDrain();
+  wsConn.addEventListener('close', () => {
+    if (!localIsCapturing) return;
+    scheduleLocalReconnect(sessionId);
+  }, { once: true });
+}
+
+function scheduleLocalReconnect(sessionId) {
+  const delay = Math.min(1000 * (2 ** localReconnectAttempts), 30000);
+  localReconnectAttempts++;
+  localReconnectTimer = setTimeout(async () => {
+    if (!localIsCapturing) return;
+    try {
+      await connectLocalSocket(sessionId);
+    } catch (_) {
+      if (localIsCapturing) scheduleLocalReconnect(sessionId);
+    }
+  }, delay);
+}
+
+async function ensureLocalSocketForStop(sessionId) {
+  if (localSocket?.readyState === WebSocket.OPEN) return true;
+  if (localSocket?.readyState === WebSocket.CONNECTING) {
+    const opened = await waitForSocketOpen(localSocket, 1500);
+    if (opened) return true;
+  }
+  if (!sessionId) return false;
+  try {
+    const wsConn = new WebSocket(`ws://${BACKEND_URL}/ws/audio?session=${sessionId}`);
+    localSocket = wsConn;
+    wsConn.binaryType = 'arraybuffer';
+    return await waitForSocketOpen(wsConn, 1500);
+  } catch (_) {
+    return false;
+  }
+}
 
 function setCaptureState(state) {
   const sourceLocked = state === true || state === 'starting';
@@ -99,28 +216,37 @@ async function startLocalTabOnlyCapture(sessionId) {
   localTabAudioCtx.createMediaStreamSource(localDisplayStream).connect(destination);
 
   localTabStream = destination.stream;
-  localSocket = new WebSocket(`ws://${BACKEND_URL}/ws/audio?session=${sessionId}`);
-  localSocket.binaryType = 'arraybuffer';
-  await new Promise((resolve, reject) => {
-    localSocket.onopen = resolve;
-    localSocket.onerror = () => reject(new Error('websocket connection failed'));
-  });
+  localIsCapturing = true;
+  await connectLocalSocket(sessionId);
 
   localRecorder = new MediaRecorder(localTabStream, {
     mimeType: 'audio/webm;codecs=opus',
     audioBitsPerSecond: 128000,
   });
-  localRecorder.ondataavailable = async (event) => {
+  localRecorder.ondataavailable = (event) => {
     if (!event.data || event.data.size === 0) return;
-    if (localSocket && localSocket.readyState === WebSocket.OPEN) {
-      localSocket.send(await event.data.arrayBuffer());
+    if (localPendingChunks.length >= LOCAL_MAX_QUEUE_CHUNKS) {
+      localPendingChunks.shift();
     }
+    localPendingChunks.push(event.data);
+    triggerLocalDrain();
   };
   localRecorder.start(1000);
 }
 
-function stopLocalTabOnlyCapture() {
-  if (localRecorder && localRecorder.state !== 'inactive') localRecorder.stop();
+async function stopLocalTabOnlyCapture() {
+  localIsCapturing = false;
+  if (localReconnectTimer) {
+    clearTimeout(localReconnectTimer);
+    localReconnectTimer = null;
+  }
+
+  if (localRecorder && localRecorder.state !== 'inactive') {
+    await new Promise((resolve) => {
+      localRecorder.onstop = resolve;
+      localRecorder.stop();
+    });
+  }
   localRecorder = null;
 
   if (localTabStream) {
@@ -136,13 +262,24 @@ function stopLocalTabOnlyCapture() {
     localTabAudioCtx = null;
   }
 
-  if (localSocket) {
-    if (localSocket.readyState === WebSocket.OPEN) {
+  const canFlush = await ensureLocalSocketForStop(localSessionId);
+  if (canFlush && localSocket?.readyState === WebSocket.OPEN) {
+    await triggerLocalDrain();
+    try {
       localSocket.send('stop');
+    } catch (_) {}
+    try {
       localSocket.close();
-    }
-    localSocket = null;
+    } catch (_) {}
+  } else if (localSocket) {
+    try {
+      localSocket.close();
+    } catch (_) {}
   }
+  localSocket = null;
+  localPendingChunks = [];
+  localDrainInFlight = null;
+  localReconnectAttempts = 0;
 }
 
 btnStart.addEventListener('click', async () => {
@@ -171,7 +308,7 @@ btnStart.addEventListener('click', async () => {
       connectTranscript(localSessionId);
       return;
     } catch (e) {
-      stopLocalTabOnlyCapture();
+      await stopLocalTabOnlyCapture();
       localSessionId = null;
       setCaptureState(false);
       setStatus('disconnected', e?.message || 'tab-only capture failed');
@@ -213,7 +350,7 @@ btnStart.addEventListener('click', async () => {
 btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
   if (localSessionId) {
-    stopLocalTabOnlyCapture();
+    await stopLocalTabOnlyCapture();
     localSessionId = null;
     await chrome.storage.local.remove('activeSessionId');
     disconnect();
@@ -283,6 +420,7 @@ function clearTranscript() {
 // --- duration timer ---
 
 function startDurationTimer() {
+  stopDurationTimer();
   startTime = Date.now();
   durationTimer = setInterval(() => {
     const elapsed = (Date.now() - startTime) / 1000;
@@ -365,23 +503,32 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     connectTranscript(message.sessionId);
     sendResponse({ ok: true });
   } else if (message.action === 'transcript_stop') {
-    disconnect();
-    stopLocalTabOnlyCapture();
-    localSessionId = null;
-    setCaptureState(false);
-    sendResponse({ ok: true });
+    (async () => {
+      disconnect();
+      await stopLocalTabOnlyCapture();
+      localSessionId = null;
+      setCaptureState(false);
+      sendResponse({ ok: true });
+    })();
     return true;
   }
   return false;
 });
 
-// --- on load: check if there's an active session ---
-
-chrome.storage.local.get(['activeSessionId'], (result) => {
-  if (result.activeSessionId) {
-    connectTranscript(result.activeSessionId);
+// --- on load: reconnect only when capture is actually active ---
+async function restoreActiveCapture() {
+  const state = await chrome.runtime.sendMessage({ action: 'get_capture_state' }).catch(() => null);
+  if (state?.ok && state.capturing && state.sessionId) {
+    setCaptureState(true);
+    connectTranscript(state.sessionId);
+    return;
   }
-});
+
+  setCaptureState(false);
+  await chrome.storage.local.remove('activeSessionId');
+}
+
+restoreActiveCapture();
 
 // --- summarize button ---
 

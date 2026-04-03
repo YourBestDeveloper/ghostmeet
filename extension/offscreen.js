@@ -3,6 +3,7 @@ let tabStream = null;
 let micStream = null;
 let audioContext = null;
 let socket = null;
+let currentSessionId = null;
 
 // Chunk queue — ensures ordered, reliable delivery even across reconnects
 let chunkQueue = [];         // Blob entries waiting to be sent
@@ -11,6 +12,51 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let isCapturing = false;
 const MAX_QUEUE_CHUNKS = 60; // ~60s buffer at 1s per chunk
+
+function waitForSocketOpen(sock, timeoutMs = 2000) {
+  if (!sock) return Promise.resolve(false);
+  if (sock.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  if (sock.readyState !== WebSocket.CONNECTING) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      sock.removeEventListener('open', onOpen);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(false);
+    }, timeoutMs);
+    const onOpen = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('error', onDone);
+      sock.removeEventListener('close', onDone);
+      resolve(true);
+    };
+    const onDone = () => {
+      clearTimeout(timer);
+      sock.removeEventListener('open', onOpen);
+      resolve(false);
+    };
+    sock.addEventListener('open', onOpen, { once: true });
+    sock.addEventListener('error', onDone, { once: true });
+    sock.addEventListener('close', onDone, { once: true });
+  });
+}
+
+async function ensureSocketOpenForStop(sessionId) {
+  if (socket?.readyState === WebSocket.OPEN) return true;
+  if (socket?.readyState === WebSocket.CONNECTING) {
+    const opened = await waitForSocketOpen(socket, 1500);
+    if (opened) return true;
+  }
+  if (!sessionId) return false;
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:8877/ws/audio?session=${sessionId}`);
+    socket = ws;
+    ws.binaryType = 'arraybuffer';
+    return await waitForSocketOpen(ws, 1500);
+  } catch (_) {
+    return false;
+  }
+}
 
 function reportError(error) {
   console.error('[offscreen]', error);
@@ -128,6 +174,7 @@ async function _drainQueue() {
 
 async function startCapture(streamId, sessionId, sources) {
   if (mediaRecorder) throw new Error('already capturing');
+  currentSessionId = sessionId;
 
   const captureTab = sources?.tab !== false && streamId;
   const captureMic = sources?.mic === true;
@@ -232,6 +279,7 @@ async function startCapture(streamId, sessionId, sources) {
 }
 
 async function stopCapture() {
+  const stopSessionId = currentSessionId;
   isCapturing = false;
 
   // Cancel any pending reconnect
@@ -266,12 +314,22 @@ async function stopCapture() {
   // Flush remaining queued chunks then close socket.
   // await processQueue() correctly waits for any in-flight drain to complete
   // before we send 'stop' and close — guaranteeing the last chunk is delivered.
-  if (socket && socket.readyState === WebSocket.OPEN) {
+  const canFlush = await ensureSocketOpenForStop(stopSessionId);
+  if (canFlush && socket && socket.readyState === WebSocket.OPEN) {
     await processQueue();
-    socket.send('stop');
-    socket.close();
+    try {
+      socket.send('stop');
+    } catch (_) {}
+    try {
+      socket.close();
+    } catch (_) {}
+  } else if (socket) {
+    try {
+      socket.close();
+    } catch (_) {}
   }
   socket = null;
+  currentSessionId = null;
 
   // Reset queue state
   chunkQueue = [];
